@@ -1,0 +1,3 @@
+[submodule "submodules/hello-world"]
+	path = submodules/hello-world
+	url = https://github.com/octocat/Hello-World.git
