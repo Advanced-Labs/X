@@ -12,4 +12,5 @@ const API = {
     getUser: (id) => fetchJSON(`/users/${id}`),
     getItems: () => fetchJSON("/items"),
     getItemsByOwner: (ownerId) => fetchJSON(`/items/by-owner/${ownerId}`),
+    getLowStockItems: () => fetchJSON("/items/low-stock"),
 };

@@ -43,3 +43,5 @@ li:last-child { border-bottom: none; }
 
 .price { color: #2a9d2a; font-weight: bold; }
 .email { color: #888; }
+.sold-out { opacity: 0.5; }
+.sold-out-label { color: #999; font-weight: bold; }

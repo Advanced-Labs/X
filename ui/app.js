@@ -25,7 +25,14 @@ document.addEventListener("DOMContentLoaded", async () => {
         items.forEach(item => {
             const li = document.createElement("li");
             const categoryName = CATEGORIES[item.category_id] || "Unknown";
-            li.innerHTML = `<span>${item.name}</span><span class="category">${categoryName}</span><span class="price">$${item.price.toFixed(2)}</span>`;
+            const soldOut = item.quantity === 0;
+            if (soldOut) {
+                li.classList.add("sold-out");
+            }
+            const priceOrLabel = soldOut
+                ? `<span class="sold-out-label">Sold out</span>`
+                : `<span class="price">$${item.price.toFixed(2)}</span>`;
+            li.innerHTML = `<span>${item.name}</span><span class="category">${categoryName}</span>${priceOrLabel}`;
             itemsList.appendChild(li);
         });
     } catch (e) {

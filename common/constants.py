@@ -22,6 +22,8 @@ CATEGORIES = {
     3: "Toys",
 }
 
+LOW_STOCK_THRESHOLD = 5
+
 VALID_SORT_FIELDS = ["id", "name", "created_at", "updated_at"]
 DEFAULT_SORT_FIELD = "id"
 DEFAULT_SORT_ORDER = "asc"

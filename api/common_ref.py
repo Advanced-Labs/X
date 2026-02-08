@@ -18,3 +18,11 @@ def get_category_name(category_id):
         return _get_category_name(category_id)
     except ImportError:
         return "Unknown"
+
+
+def get_low_stock_threshold():
+    try:
+        from constants import LOW_STOCK_THRESHOLD
+        return LOW_STOCK_THRESHOLD
+    except ImportError:
+        return 5
