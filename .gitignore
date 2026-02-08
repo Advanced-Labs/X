@@ -1,0 +1,10 @@
+# Subtree sync logs (content only, keep the directory)
+logs/*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

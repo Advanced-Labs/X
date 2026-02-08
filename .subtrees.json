@@ -1,0 +1,26 @@
+{
+  "description": "Subtree manifest for the umbrella repository. Maps each directory prefix to its source repo.",
+  "subtrees": {
+    "api": {
+      "prefix": "api",
+      "remote_name": "subtree-api",
+      "remote_url": "https://github.com/Advanced-Labs/test-api.git",
+      "upstream_branch": "master",
+      "description": "Python Flask API with users and items endpoints"
+    },
+    "ui": {
+      "prefix": "ui",
+      "remote_name": "subtree-ui",
+      "remote_url": "https://github.com/Advanced-Labs/test-ui.git",
+      "upstream_branch": "master",
+      "description": "HTML/JS frontend for users and items"
+    },
+    "common": {
+      "prefix": "common",
+      "remote_name": "subtree-common",
+      "remote_url": "https://github.com/Advanced-Labs/test-common.git",
+      "upstream_branch": "master",
+      "description": "Shared Python utilities, config, and constants"
+    }
+  }
+}
