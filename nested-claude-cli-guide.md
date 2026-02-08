@@ -253,24 +253,53 @@ Every API call in the main session sends all that context; child agents avoid th
 
 ---
 
-## Agent Teams (Experimental)
+## Agent Teams (Experimental -- Verified Working)
 
 Agent teams allow multiple agents to **communicate directly with each other**, not just
 report back to you. This is more powerful than parallel sub-agents but uses significantly
 more tokens.
 
+**Tested and confirmed working** from within the web session (2025-02 on CLI v2.1.37).
+
 ### Prerequisites
 
-Agent teams require the experimental flag. Set it via environment or settings:
+Agent teams require the experimental flag. Pass it as an env var when invoking the child:
 
-```json
-// In settings.json or .claude/settings.json
-{
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
-  }
-}
+```bash
+TOKEN=$(cat /home/claude/.claude/remote/.session_ingress_token)
+timeout 120 env \
+  CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
+  CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="" \
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
+  claude -p "Create a team called 'my-team' with 2 teammates..." \
+  --model haiku \
+  --output-format json \
+  --permission-mode acceptEdits
 ```
+
+**Important constraints:**
+- Use `--permission-mode acceptEdits` (not `bypassPermissions` -- blocked for root)
+- Give generous timeouts (120s+) -- teams need time to spawn, communicate, and clean up
+- Ensure git is clean (commit/push first) or the stop hook will derail teammates
+
+### What Happens Under the Hood
+
+When the child agent creates a team:
+1. `TeamCreate` tool creates `~/.claude/teams/{name}/config.json` and `~/.claude/tasks/{name}/`
+2. Teammates are spawned as additional Claude Code processes (each with own context)
+3. `SendMessage` routes messages between teammates via a mailbox system
+4. Teammates can self-claim tasks from the shared task list
+5. `TeamDelete` cleans up team resources when done
+
+### Available Team Tools
+
+When `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is set, three tools are added:
+
+| Tool | Purpose |
+|------|---------|
+| `TeamCreate` | Create a team, spawn teammates, define task list |
+| `SendMessage` | Send message to a specific teammate or broadcast to all |
+| `TeamDelete` | Clean up team resources |
 
 ### How Teams Work
 
@@ -298,17 +327,14 @@ Agent teams require the experimental flag. Set it via environment or settings:
 - **New modules/features**: Each teammate owns a separate component
 - **Cross-layer work**: Frontend, backend, and tests each owned by different teammates
 
-### Display Modes
-
-- **In-process**: All teammates in one terminal (default)
-- **Split panes**: Each teammate in its own pane (requires tmux or iTerm2)
-
 ### Limitations (Current)
 
 - No session resumption with in-process teammates
 - One team per session
 - No nested teams (teammates can't spawn their own teams)
 - Leader is fixed for the team's lifetime
+- `--dangerously-skip-permissions` / `bypassPermissions` blocked when running as root
+- Split panes (tmux/iTerm2) not available in web container -- use in-process mode
 
 Full documentation: https://code.claude.com/docs/en/agent-teams
 
@@ -342,6 +368,48 @@ Full documentation: https://code.claude.com/docs/en/agent-teams
 
 ---
 
+## Gotchas and Pitfalls
+
+### Stop Hooks and Untracked Files
+
+The web harness installs a stop hook (`~/.claude/stop-hook-git-check.sh`) that fires
+when any Claude process finishes. It checks for uncommitted/untracked files and, if found,
+exits with code 2 -- which tells the CLI "don't stop, keep going and fix this."
+
+This means: **if you create files (like `.claude/agents/*.md`) and don't commit them
+before spawning child agents, the stop hook will derail every child agent into an
+infinite loop trying to commit files it didn't create.**
+
+**Fix**: Always commit and push before spawning child agents, or use `--settings` to
+override hooks (though this may not always work depending on settings precedence).
+
+### Root User Restrictions
+
+The web container runs as root. This means:
+- `--dangerously-skip-permissions` is **blocked** (security restriction)
+- `--permission-mode bypassPermissions` is also **blocked** (same reason)
+- Use `--permission-mode acceptEdits` or `--permission-mode dontAsk` instead
+
+### Child Agents Share Your Filesystem
+
+Child agents share the same filesystem, including:
+- `~/.claude/` directory (settings, memory, agent definitions)
+- The project working directory
+- `/tmp/` for output files
+
+This means child agents can read your MEMORY.md, modify files, and even write to
+your auto-memory (as discovered when a test agent wrote "Remember the word: BANANA"
+to the shared memory file). Plan for this -- use `--tools` to restrict write access
+when appropriate.
+
+### Timeout Behavior
+
+- Simple `-p` queries: 30-45s is usually sufficient
+- Agents with tool use: 60s+
+- Agent teams: 120s+ (need time to spawn, communicate, clean up)
+- If an agent times out (exit code 124), it produced no JSON output
+- Use `timeout <seconds>` wrapper to prevent indefinite hangs
+
 ## Important Notes
 
 - **Token file expiry**: The session ingress token has an expiration time (check the JWT `exp`
@@ -352,4 +420,5 @@ Full documentation: https://code.claude.com/docs/en/agent-teams
   They do not affect the parent session.
 - **Billing**: Uses the same subscription/account as the parent session (not separate API billing).
 - **Permissions**: Child agents inherit the environment's permission context. Use
-  `--permission-mode` or `--dangerously-skip-permissions` as appropriate for your sandbox.
+  `--permission-mode acceptEdits` or `--permission-mode dontAsk` in the web container
+  (not `bypassPermissions` -- blocked for root).
