@@ -4,3 +4,6 @@
 [submodule "submodules/gitignore"]
 	path = submodules/gitignore
 	url = https://github.com/github/gitignore
+[submodule "submodules/linux"]
+	path = submodules/linux
+	url = https://github.com/torvalds/linux
