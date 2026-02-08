@@ -173,13 +173,15 @@ claude_agent -p "Design the architecture" --model opus
 | Role | Recommended Model | Reasoning |
 |------|-------------------|-----------|
 | **Boss (you)** | Opus 4.6 | Already set by the web session; complex coordination |
-| **Team Leader** | Opus 4.6 or Sonnet 4.5 | Needs to reason about task decomposition, coordination |
-| **Teammate (implementation)** | Sonnet 4.5 | Good balance for coding tasks |
-| **Teammate (search/triage)** | Haiku 4.5 | Cheap and fast for focused work |
-| **Solo sub-agent** | Haiku or Sonnet | Depends on task complexity |
+| **Team Leader** | Opus 4.6 | Top of the team, needs strong reasoning for task decomposition and coordination |
+| **Teammate (implementation)** | Opus 4.6 or Sonnet 4.5 | Opus for serious systems work (kernels, hypervisors, runtimes); Sonnet for standard app code |
+| **Teammate (search/triage)** | Haiku 4.5 or Sonnet 4.5 | Cheap and fast for focused lookup work |
+| **Solo sub-agent** | Match to task | Haiku for simple queries, Sonnet for moderate work, Opus for anything requiring deep reasoning |
 
 **Note**: The child agent's model is independent of the parent session's model.
 Using Haiku for a search task costs ~20x less than Opus for the same task.
+For complex systems programming (OS kernels, hypervisors, runtimes, compilers), always
+use Opus 4.6 for implementers -- the quality difference matters more than the cost savings.
 
 ---
 
@@ -287,6 +289,115 @@ exclusively to the original process.
 **The right pattern**: Every spawned claude gets a new session automatically (the default
 when you just use `-p`). Use `--resume <session-id>` only to resume **that agent's own**
 prior session, never yours.
+
+---
+
+## Session Persistence: What Survives and What Doesn't
+
+Understanding where session data lives is critical for long-running multi-team projects.
+
+### Storage Model
+
+| Session type | Local storage | Remote storage | Survives container destruction? |
+|---|---|---|---|
+| **Boss (you)** | `~/.claude/projects/.../UUID.jsonl` | Session ingress service (server-side) | **YES** (remote) |
+| **Child agents / Team Leaders** | `~/.claude/projects/.../UUID.jsonl` | None | **NO** |
+| **Teammates** | `~/.claude/projects/.../UUID/subagents/*.jsonl` | None | **NO** |
+
+The Boss session is special: it has **remote persistence** via the session ingress service
+(the `--sdk-url` and `--resume` flags in the original launch command). This is why you can
+close a web session tab, come back later, and the conversation continues.
+
+Child sessions have **local persistence only**. They're stored as `.jsonl` files under
+`~/.claude/projects/-home-user-X/`. When you `--resume <uuid>`, the CLI looks for
+`<uuid>.jsonl` in that directory.
+
+### Container Lifecycle
+
+The web session container uses ephemeral storage (`none 30G`). Everything outside of git
+lives on this filesystem. When the container is destroyed (which happens when sessions
+time out or are revisited after a gap), `~/.claude/` is **wiped**. The git repo is
+re-cloned from the remote.
+
+This means:
+- Your Boss session **survives** (loaded from session ingress on resume)
+- All child/team session files **are lost**
+- MEMORY.md in `~/.claude/projects/` is also lost (but is rebuilt from the system)
+- Files committed to git **survive** (re-cloned)
+
+### Preserving Child Sessions via Git
+
+To make child sessions survive across container rebuilds, commit a **session registry**
+to git. This is lighter and more practical than committing the raw `.jsonl` files
+(which can be 2MB+ each).
+
+#### Session Registry Pattern
+
+Maintain a registry file in your branch:
+
+```markdown
+<!-- .company/sessions/registry.md -->
+# Active Sessions Registry
+
+## Team Leaders
+
+| Codename | Session UUID | Model | Status | Created | Summary |
+|----------|-------------|-------|--------|---------|---------|
+| Alpha | a1ab99a3-7032-4d7e-bb49-f383d82c896c | opus | completed | 2026-02-08 | Cache system implementation |
+| Bravo | b2cd88f1-3e45-4a1c-9876-def012345678 | opus | in_progress | 2026-02-08 | Auth refactor |
+
+## Solo Agents
+
+| Name | Session UUID | Model | Status | Created | Summary |
+|------|-------------|-------|--------|---------|---------|
+| Coverage | c3ef77d2-5f67-4b2d-a543-abc987654321 | sonnet | completed | 2026-02-08 | Test coverage analysis |
+```
+
+This way, any Boss in any future chat thread can see what teams existed, their status,
+and their session UUIDs.
+
+#### Can Sessions Be Resumed from Other Chat Threads?
+
+**Boss session**: Yes, inherently. The server-side persistence means a new container
+loading the same session ID reconnects to the full history. This is what happens when
+you revisit an old chat thread.
+
+**Child sessions**: Only if the `.jsonl` files are present locally. Two approaches:
+
+1. **Commit `.jsonl` files to git** (heavy but complete):
+   ```bash
+   # Save session files to git
+   mkdir -p .company/sessions/data/
+   cp ~/.claude/projects/-home-user-X/LEADER_UUID.jsonl .company/sessions/data/
+   git add .company/sessions/data/ && git commit -m "Preserve team leader session"
+   ```
+   On a new container, restore them:
+   ```bash
+   cp .company/sessions/data/*.jsonl ~/.claude/projects/-home-user-X/
+   # Now --resume LEADER_UUID works
+   ```
+
+2. **Registry only** (light, accept that past sessions can't be resumed):
+   Store only the metadata. Past sessions serve as documentation, not as resumable threads.
+   New threads start fresh with the context from the registry's summaries.
+
+In most cases, **option 2 is better**. Resumed sessions carry their full accumulated
+context window, which may be stale or bloated. Starting a fresh Team Leader with a
+clear mission brief is usually more effective than resuming an old one.
+
+#### Cross-Thread Session Portability
+
+A powerful implication: child session `.jsonl` files committed to git can be resumed
+from **any** chat thread that clones the same repo. This means:
+
+- Thread A creates Team Alpha, commits its session file
+- Thread B (days later, different container) restores the file and resumes Team Alpha
+- Team Alpha's leader picks up where it left off, with full conversation history
+
+This also works for the **Boss's own child session** -- if you spawn a child claude
+with your entire conversation context summarized in a brief, that child's session
+could be resumed by a future Boss in a different thread. Effectively, institutional
+memory via git.
 
 ---
 
