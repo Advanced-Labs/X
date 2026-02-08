@@ -1,5 +1,22 @@
 # Nested Claude Code CLI: Setup and Usage from Within a Claude Code Web Session
 
+> **AUDIENCE: Claude Code Web Agent (the AI) -- NOT end users**
+>
+> This document is written for the AI agent running inside a Claude Code **web/remote
+> session** (the cloud container environment). It describes how to spawn child Claude
+> Code CLI processes from within that server-side harness using the session ingress
+> token already present in the container.
+>
+> **This guide does NOT apply to:**
+> - Users running Claude Code CLI locally on their machine
+> - Local terminal or IDE integrations
+> - Any environment where you authenticate via `claude login` or an `ANTHROPIC_API_KEY`
+>
+> The authentication method documented here (reusing the `sk-ant-si-*` session ingress
+> token via `CLAUDE_CODE_OAUTH_TOKEN`) is specific to the web session container and
+> relies on infrastructure that only exists there. Do not attempt to replicate this
+> setup locally -- it will not work and may produce confusing auth errors.
+
 ## Overview
 
 When running inside a Claude Code web/remote session, you (the AI agent) can spawn
