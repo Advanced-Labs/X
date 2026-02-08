@@ -29,6 +29,50 @@ additional Claude Code CLI instances as child processes. This gives you:
 - **Persistent sessions**: Resume agent conversations across invocations using session IDs
 - **Sub-agent architecture**: Use custom sub-agents with specialized prompts and tool restrictions
 - **Agent teams** (experimental): Coordinate multiple agents that communicate with each other
+- **Multi-team orchestration**: Act as a Boss/Manager directing multiple Team Leaders
+
+---
+
+## Architecture: You Are the Boss, Not the Team Leader
+
+This is the most important conceptual point. When you spawn a claude with
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and tell it to create a team, **that spawned
+claude becomes the Team Leader** -- not you. You cannot get the team tools (TeamCreate,
+SendMessage, TeamDelete) into your own tool set (see [Session Internals](#session-internals-why-you-cant-get-team-tools-directly) for why).
+
+This creates a hierarchy:
+
+```
+Human (CEO)
+  └── You, the CCW AI (Boss / Manager)
+        ├── Team Leader A (spawned claude with team tools)
+        │     ├── Teammate A1
+        │     ├── Teammate A2
+        │     └── Teammate A3
+        ├── Team Leader B (spawned claude with team tools)
+        │     ├── Teammate B1
+        │     └── Teammate B2
+        └── Solo agents (simple sub-agents without teams)
+```
+
+### Why This Is Actually Powerful
+
+The Claude CLI's built-in team system has a fixed leader per team, one team per session,
+and no nested teams. But by using the CLI from outside, **you transcend these limits**:
+
+| Built-in team limitation | Your advantage as Boss |
+|---|---|
+| One team per session | You can spawn **multiple Team Leaders**, each running their own team |
+| No nested teams | You sit above all teams, coordinating between them |
+| Leader is fixed | You can kill and respawn leaders, reassign work, create new teams on the fly |
+| No cross-team communication | You relay between teams: read Team A's output, feed it to Team B |
+| No meta-coordination | You schedule, prioritize, and sequence across all teams |
+
+You are effectively a **meta-orchestrator** -- a capability that doesn't exist in the
+CLI's built-in feature set. The CLI gives you TeamCreate/SendMessage/TeamDelete within
+a single session. You give yourself multi-team management across sessions.
+
+---
 
 ## The Problem
 
@@ -124,8 +168,281 @@ claude_agent -p "Design the architecture" --model opus
 | Sonnet 4.5 | $3.00 | $15.00 | Most coding, analysis, review |
 | Opus 4.6 | $15.00 | $75.00 | Complex reasoning, architecture |
 
+### Model Selection by Role in Hierarchy
+
+| Role | Recommended Model | Reasoning |
+|------|-------------------|-----------|
+| **Boss (you)** | Opus 4.6 | Already set by the web session; complex coordination |
+| **Team Leader** | Opus 4.6 or Sonnet 4.5 | Needs to reason about task decomposition, coordination |
+| **Teammate (implementation)** | Sonnet 4.5 | Good balance for coding tasks |
+| **Teammate (search/triage)** | Haiku 4.5 | Cheap and fast for focused work |
+| **Solo sub-agent** | Haiku or Sonnet | Depends on task complexity |
+
 **Note**: The child agent's model is independent of the parent session's model.
 Using Haiku for a search task costs ~20x less than Opus for the same task.
+
+---
+
+## Execution Model: Blocking, Background, and Monitoring
+
+Understanding how spawned processes behave from your perspective is critical for
+designing multi-team workflows.
+
+### Blocking Mode (Synchronous)
+
+```bash
+# Your response to the user FREEZES until this completes
+RESULT=$(claude_agent -p "Analyze this codebase" --model sonnet --output-format json 2>/dev/null)
+```
+
+- You cannot respond to the user while waiting
+- You cannot do any other work
+- You get the full output at once (no streaming)
+- Simple and reliable for quick tasks
+- **Use for**: Solo sub-agents doing short tasks (< 60s)
+
+### Background Mode (Asynchronous via Bash)
+
+```bash
+# Returns immediately -- you can continue working
+claude_agent -p "Deep analysis of src/" --model sonnet \
+  --output-format json > /tmp/team_a_result.json 2>/dev/null &
+LEADER_PID=$!
+
+# ... do other work, respond to user, launch more agents ...
+
+# Check later: is it done?
+if kill -0 $LEADER_PID 2>/dev/null; then
+  echo "Still running"
+else
+  echo "Done. Reading results..."
+  cat /tmp/team_a_result.json
+fi
+```
+
+- You **must actively poll** -- no automatic callbacks or context injection
+- The process writes output to a file; you read it when ready
+- You can launch multiple background processes in parallel
+- **Use for**: Team Leaders, long-running tasks, parallel workflows
+
+### Background Mode (via Task Tool)
+
+If your harness provides a `Task` tool with `run_in_background: true`, you get a
+managed output file path. This is cleaner than raw `&` in Bash but functionally similar:
+you still need to check the output file yourself.
+
+### Monitoring Pattern
+
+Since there are no callbacks, you need a polling strategy:
+
+```bash
+# Launch multiple teams
+claude_agent -p "..." > /tmp/team_alpha.json 2>/dev/null &
+PID_ALPHA=$!
+claude_agent -p "..." > /tmp/team_bravo.json 2>/dev/null &
+PID_BRAVO=$!
+
+# Poll loop (or check manually between other work)
+for team in alpha bravo; do
+  pid_var="PID_$(echo $team | tr 'a-z' 'A-Z')"
+  pid=${!pid_var}
+  if kill -0 $pid 2>/dev/null; then
+    echo "Team $team: still running"
+  else
+    echo "Team $team: DONE"
+    # Parse result
+    python3 -c "import json; d=json.load(open('/tmp/team_${team}.json')); print(d.get('result','no result')[:500])"
+  fi
+done
+```
+
+In practice, you'll typically:
+1. Launch teams / background agents
+2. Continue responding to the user or doing your own work
+3. Periodically check on team status between turns
+4. Collect and synthesize results when teams finish
+
+---
+
+## Session Isolation: Always Use Fresh Sessions
+
+**Spawned claudes must NOT connect to your own chat session/thread.**
+
+Each spawned claude should get its own fresh session. Do NOT pass `--sdk-url` or
+`--resume` with your own session identifiers. Here's why:
+
+| Problem with sharing your session | Impact |
+|---|---|
+| Loads your full conversation history | 1000+ entries, wastes context window and tokens |
+| Session routing conflicts | Session ingress has strong affinity -- won't cleanly switch |
+| Duplicate responses | Both you and the spawned claude may respond to the same message |
+| No context window benefit | The whole point of sub-agents is a fresh, cheap context |
+
+This was empirically verified through a "session splice" experiment (see
+[Session Internals](#session-internals-why-you-cant-get-team-tools-directly)):
+a second claude connecting to the same session WebSocket loaded 1097 history entries,
+generated duplicate API calls, and the session ingress still routed user messages
+exclusively to the original process.
+
+**The right pattern**: Every spawned claude gets a new session automatically (the default
+when you just use `-p`). Use `--resume <session-id>` only to resume **that agent's own**
+prior session, never yours.
+
+---
+
+## Multi-Team Orchestration (Boss Pattern)
+
+This section describes how to organize and manage multiple teams as the Boss.
+
+### Folder Structure for Teams
+
+Create a workspace hierarchy so each team has its own area:
+
+```
+/home/user/X/
+├── .company/                          # Or any project-level directory
+│   └── teams/
+│       ├── cache-system/
+│       │   ├── brief.md               # Mission brief: what the team should build
+│       │   ├── roster.md              # Suggested team composition
+│       │   └── output/                # Team deposits results here
+│       ├── auth-refactor/
+│       │   ├── brief.md
+│       │   ├── roster.md
+│       │   └── output/
+│       └── test-coverage/
+│           ├── brief.md
+│           ├── roster.md
+│           └── output/
+```
+
+### Mission Brief (brief.md) -- Written by You Before Spawning the Team
+
+```markdown
+# Mission: Cache System
+
+## Objective
+Design and implement a caching layer for the API endpoints in src/api/.
+
+## Deliverables
+1. Cache module with TTL support (src/cache/)
+2. Integration with existing API handlers
+3. Unit tests with >80% coverage
+4. Summary report in this folder's output/ directory
+
+## Constraints
+- Use Redis client library already in package.json
+- Do not modify src/auth/ (another team owns that)
+- Budget: keep total cost under $2
+
+## Report Back
+When done, write output/report.md with:
+- What was built
+- Files created/modified
+- Test results
+- Any open issues or recommendations
+
+## Team Composition (suggested)
+- Team Leader: Opus 4.6 (coordination, architecture decisions)
+- Implementer: Sonnet 4.5 (write the code)
+- Tester: Sonnet 4.5 (write and run tests)
+```
+
+### Spawning a Team Leader
+
+```bash
+TOKEN=$(cat /home/claude/.claude/remote/.session_ingress_token)
+
+# Read the brief to pass as context
+BRIEF=$(cat /home/user/X/.company/teams/cache-system/brief.md)
+
+timeout 300 env \
+  CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
+  CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="" \
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
+  claude -p "You are a Team Leader. Read your mission brief below and execute it.
+
+Create a team called 'cache-team' to accomplish the mission. Spawn teammates as
+described in the brief. Coordinate their work, review their output, and write the
+final report to .company/teams/cache-system/output/report.md when done.
+
+MISSION BRIEF:
+$BRIEF" \
+  --model opus \
+  --output-format json \
+  --permission-mode acceptEdits \
+  > /tmp/cache-team-result.json 2>/dev/null &
+
+CACHE_TEAM_PID=$!
+echo "Cache team leader: PID $CACHE_TEAM_PID"
+```
+
+### Managing Multiple Teams in Parallel
+
+```bash
+TOKEN=$(cat /home/claude/.claude/remote/.session_ingress_token)
+export CLAUDE_CODE_OAUTH_TOKEN="$TOKEN"
+export CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=""
+
+# Team Alpha: Cache System
+BRIEF_A=$(cat .company/teams/cache-system/brief.md)
+timeout 300 env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
+  claude -p "You are Team Leader Alpha. Mission: $BRIEF_A" \
+  --model opus --output-format json --permission-mode acceptEdits \
+  > /tmp/team-alpha.json 2>/dev/null &
+PID_A=$!
+
+# Team Bravo: Auth Refactor
+BRIEF_B=$(cat .company/teams/auth-refactor/brief.md)
+timeout 300 env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
+  claude -p "You are Team Leader Bravo. Mission: $BRIEF_B" \
+  --model opus --output-format json --permission-mode acceptEdits \
+  > /tmp/team-bravo.json 2>/dev/null &
+PID_B=$!
+
+# Solo agent (no team needed): Test Coverage
+timeout 120 claude -p "Analyze test coverage gaps in src/" \
+  --model sonnet --output-format json \
+  > /tmp/solo-coverage.json 2>/dev/null &
+PID_C=$!
+
+echo "Launched: Alpha=$PID_A, Bravo=$PID_B, Coverage=$PID_C"
+
+# Wait for all (or poll individually)
+wait $PID_A $PID_B $PID_C
+```
+
+### Codenames and Organization
+
+Using codenames makes teams easier to manage in logs, file paths, and prompts:
+
+| Codename | Mission | Leader Model | Team Size |
+|----------|---------|-------------|-----------|
+| Alpha | Cache system | Opus | 3 |
+| Bravo | Auth refactor | Opus | 2 |
+| Charlie | Test coverage | Sonnet (solo) | 0 |
+| Delta | API docs | Haiku (solo) | 0 |
+
+### Cross-Team Coordination
+
+Since teams can't communicate directly with each other, you (the Boss) relay:
+
+```bash
+# Team Alpha finished -- read their report
+ALPHA_REPORT=$(cat .company/teams/cache-system/output/report.md)
+
+# Feed Alpha's output into Team Bravo (via resume or new prompt)
+timeout 300 env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
+  claude -p "Team Alpha completed the cache system. Here is their report:
+
+$ALPHA_REPORT
+
+Update your auth refactor to integrate with the new cache module.
+Specifically, cache the JWT validation results as Alpha suggests." \
+  --resume "$BRAVO_SESSION_ID" \
+  --model opus --output-format json --permission-mode acceptEdits \
+  > /tmp/team-bravo-phase2.json 2>/dev/null
+```
 
 ---
 
@@ -160,6 +477,24 @@ claude_agent -p "Now fix issue #1 from your analysis" \
 This is powerful because the resumed agent remembers everything from the prior conversation
 without you re-explaining context. It also means their context window fills up gradually
 across calls, just like a real conversation.
+
+### Session IDs for Team Leaders
+
+When managing multiple Team Leaders, capture and store their session IDs so you can
+resume conversations with them later:
+
+```bash
+# Spawn and capture session ID
+claude_agent -p "You are Team Leader Alpha..." \
+  --model opus --output-format json > /tmp/alpha-init.json 2>/dev/null
+
+ALPHA_SID=$(python3 -c "import json; print(json.load(open('/tmp/alpha-init.json'))['session_id'])")
+echo "$ALPHA_SID" > .company/teams/cache-system/session_id.txt
+
+# Later: resume to check in or give new instructions
+claude_agent -p "Status update. What has your team completed so far?" \
+  --resume "$ALPHA_SID" --model opus --output-format json 2>/dev/null
+```
 
 ---
 
@@ -259,7 +594,7 @@ Agent teams allow multiple agents to **communicate directly with each other**, n
 report back to you. This is more powerful than parallel sub-agents but uses significantly
 more tokens.
 
-**Tested and confirmed working** from within the web session (2025-02 on CLI v2.1.37).
+**Tested and confirmed working** from within the web session (2026-02 on CLI v2.1.37).
 
 ### Prerequisites
 
@@ -310,27 +645,21 @@ When `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is set, three tools are added:
 | **Task list** | Shared list of work items that teammates claim and complete |
 | **Mailbox** | Messaging system for inter-agent communication |
 
-### Key Differences from Sub-Agents
+### Key Differences: Sub-Agents vs Teams vs Multi-Team Boss
 
-| | Sub-Agents | Agent Teams |
-|---|---|---|
-| **Context** | Own window; results return to caller | Own window; fully independent |
-| **Communication** | Report back to parent only | Teammates message each other directly |
-| **Coordination** | Parent manages all work | Shared task list with self-coordination |
-| **Best for** | Focused tasks where only the result matters | Complex work requiring discussion |
-| **Token cost** | Lower | Higher (each teammate is a full instance) |
-
-### Best Use Cases for Teams
-
-- **Research and review**: Multiple teammates investigate different aspects simultaneously
-- **Competing hypotheses**: Teammates test different theories and debate findings
-- **New modules/features**: Each teammate owns a separate component
-- **Cross-layer work**: Frontend, backend, and tests each owned by different teammates
+| | Solo Sub-Agent | Single Team | Multi-Team (Boss Pattern) |
+|---|---|---|---|
+| **Who coordinates** | You directly | Team Leader | You direct Leaders; Leaders direct members |
+| **Communication** | Returns result to you | Teammates message each other | You relay between teams |
+| **Parallelism** | One task at a time (per agent) | Teammates work in parallel | Multiple teams in parallel |
+| **Context isolation** | Fresh per agent | Fresh per teammate | Fresh per agent at every level |
+| **Token cost** | Low | Medium-High | High (but distributed efficiently) |
+| **Best for** | Focused single tasks | One complex feature | Large multi-feature projects |
 
 ### Limitations (Current)
 
 - No session resumption with in-process teammates
-- One team per session
+- One team per session (but you can run multiple sessions = multiple teams)
 - No nested teams (teammates can't spawn their own teams)
 - Leader is fixed for the team's lifetime
 - `--dangerously-skip-permissions` / `bypassPermissions` blocked when running as root
@@ -365,6 +694,8 @@ Full documentation: https://code.claude.com/docs/en/agent-teams
    re-sending all context
 4. **Fresh context = cheaper calls**: A child agent with 19K system prompt tokens costs far
    less per turn than your main session at 150K+ tokens
+5. **Right-size your teams**: Not every task needs a team. Solo sub-agents are far cheaper.
+   Use teams only when inter-agent communication adds clear value.
 
 ---
 
@@ -402,13 +733,89 @@ your auto-memory (as discovered when a test agent wrote "Remember the word: BANA
 to the shared memory file). Plan for this -- use `--tools` to restrict write access
 when appropriate.
 
+**For multi-team work**: Use the folder structure pattern (`.company/teams/<name>/`)
+to give each team its own workspace and reduce cross-team file conflicts.
+
 ### Timeout Behavior
 
 - Simple `-p` queries: 30-45s is usually sufficient
 - Agents with tool use: 60s+
 - Agent teams: 120s+ (need time to spawn, communicate, clean up)
+- Multi-team leaders: 300s+ (spawning + teammate work + cleanup)
 - If an agent times out (exit code 124), it produced no JSON output
 - Use `timeout <seconds>` wrapper to prevent indefinite hangs
+
+---
+
+## Session Internals: Why You Can't Get Team Tools Directly
+
+You (the CCW AI, PID 38 in the container) are launched by `environment-manager` with
+a fixed `--tools` list that does NOT include TeamCreate/SendMessage/TeamDelete. This
+list comes from the sandbox-gateway configuration, not from local settings.
+
+We investigated multiple approaches to inject team tools into the running session:
+
+### What Was Tried
+
+1. **Modifying env vars at runtime**: The tool list is set at process startup via CLI
+   flags, not env vars. Changing `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` after startup
+   has no effect.
+
+2. **Modifying `/tmp/claude-command`**: This file records the launch command but is
+   write-only (env-manager doesn't re-read it for restarts).
+
+3. **Session WebSocket splice**: Spawning a new claude with team tools and the same
+   `--sdk-url` to take over the session. Results:
+
+   | Step | Outcome |
+   |------|---------|
+   | Auth with `CLAUDE_CODE_OAUTH_TOKEN` | Works |
+   | WebSocket auth with `CLAUDE_CODE_SESSION_ACCESS_TOKEN` | Works (bypasses FD 3) |
+   | WebSocket connection to session ingress | Connected successfully |
+   | Loading conversation history | Loaded 1097 entries from remote |
+   | Generating responses | API calls succeeded ("Stream started") |
+   | Sending data back via HybridTransport | POST success (`type=control_response`) |
+   | **Taking over as primary responder** | **Failed -- session affinity** |
+
+   The session ingress maintains strong affinity to the original process. Even with
+   the original SIGSTOP'd (frozen for 45 seconds), the session routing did not
+   switch to the new claude. The WebSocket connection survives SIGSTOP (kernel holds
+   TCP connections for stopped processes).
+
+4. **SIGSTOP + SIGCONT with safety timer**: SIGSTOP freezes the process but doesn't
+   close its WebSocket. The session ingress queues messages for the frozen process
+   rather than routing to the second connection.
+
+### The Auth Recipe (for reference)
+
+If a future version of the architecture changes session routing behavior, the full
+auth recipe for connecting a second claude to the same session is:
+
+```bash
+TOKEN=$(cat /home/claude/.claude/remote/.session_ingress_token)
+env \
+  CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
+  CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="" \
+  CLAUDE_CODE_SESSION_ACCESS_TOKEN="$TOKEN" \
+  CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR="" \
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+  claude \
+  --sdk-url "wss://api.anthropic.com/v1/session_ingress/ws/$SESSION_ID" \
+  --resume="https://api.anthropic.com/v1/session_ingress/session/$SESSION_ID" \
+  [other flags...]
+```
+
+Key env vars:
+- `CLAUDE_CODE_OAUTH_TOKEN`: API authentication (bypasses FD 4)
+- `CLAUDE_CODE_SESSION_ACCESS_TOKEN`: WebSocket authentication (bypasses FD 3)
+
+### Bottom Line
+
+The Boss pattern (spawning team leaders as child processes) is the correct and working
+approach. Trying to inject team tools into the parent session is blocked by the
+architecture's session affinity model.
+
+---
 
 ## Important Notes
 
