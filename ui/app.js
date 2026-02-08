@@ -19,11 +19,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     try {
+        const CATEGORIES = {1: "Electronics", 2: "Tools", 3: "Toys"};
         const items = await API.getItems();
         const itemsList = document.getElementById("items-list");
         items.forEach(item => {
             const li = document.createElement("li");
-            li.innerHTML = `<span>${item.name}</span><span class="price">$${item.price.toFixed(2)}</span>`;
+            const categoryName = CATEGORIES[item.category_id] || "Unknown";
+            li.innerHTML = `<span>${item.name}</span><span class="category">${categoryName}</span><span class="price">$${item.price.toFixed(2)}</span>`;
             itemsList.appendChild(li);
         });
     } catch (e) {

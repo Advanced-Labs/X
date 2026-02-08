@@ -29,6 +29,12 @@ def validate_email(email):
     return bool(re.match(pattern, email))
 
 
+def get_category_name(category_id):
+    """Look up a category name by its ID. Returns 'Unknown' if not found."""
+    from .constants import CATEGORIES
+    return CATEGORIES.get(category_id, "Unknown")
+
+
 def parse_id(value):
     """Parse a string value to integer ID, return None if invalid."""
     try:

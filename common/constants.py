@@ -16,6 +16,12 @@ ERROR_MESSAGES = {
     "internal": "An unexpected error occurred. Please try again later.",
 }
 
+CATEGORIES = {
+    1: "Electronics",
+    2: "Tools",
+    3: "Toys",
+}
+
 VALID_SORT_FIELDS = ["id", "name", "created_at", "updated_at"]
 DEFAULT_SORT_FIELD = "id"
 DEFAULT_SORT_ORDER = "asc"
