@@ -292,200 +292,337 @@ prior session, never yours.
 
 ---
 
-## Session Persistence: What Survives and What Doesn't
+## Session Persistence and the Workspaces Protocol
 
-Understanding where session data lives is critical for long-running multi-team projects.
+Understanding where session data lives -- and how to make it survive across containers,
+threads, and even across local vs remote environments -- is critical for long-running
+multi-agent projects.
 
 ### Storage Model
 
-| Session type | Local storage | Remote storage | Survives container destruction? |
-|---|---|---|---|
-| **Boss (you)** | `~/.claude/projects/.../UUID.jsonl` | Session ingress service (server-side) | **YES** (remote) |
-| **Child agents / Team Leaders** | `~/.claude/projects/.../UUID.jsonl` | None | **NO** |
-| **Teammates** | `~/.claude/projects/.../UUID/subagents/*.jsonl` | None | **NO** |
+| Session type | Where it lives | Survives container destruction? |
+|---|---|---|
+| **L0 Boss (CCW remote)** | Server-side (session ingress) + local `.jsonl` | **YES** (remote session ID) |
+| **L0 Boss (local CLI)** | Local `.jsonl` file only | **YES** (file on user's machine) |
+| **L1 Team Leader** | Local `.jsonl` file only | **NO** (ephemeral container storage) |
+| **L2 Teammate** | Local `.jsonl` under `UUID/subagents/` | **NO** |
+| **Solo Agent** | Local `.jsonl` file only | **NO** |
 
-The Boss session is special: it has **remote persistence** via the session ingress service
-(the `--sdk-url` and `--resume` flags in the original launch command). This is why you can
-close a web session tab, come back later, and the conversation continues.
+The CCW Boss session has **remote persistence** via the session ingress service. This
+is why you can close a tab, come back later, and the conversation continues. It uses
+a server-side session ID like `session_01BcKBG6E3cP45UMs9bAbhZq`.
 
-Child sessions have **local persistence only**. They're stored as `.jsonl` files under
-`~/.claude/projects/-home-user-X/`. When you `--resume <uuid>`, the CLI looks for
-`<uuid>.jsonl` in that directory.
+Local CLI Boss sessions have file-based persistence: a `.jsonl` file on the user's
+machine under `~/.claude/projects/<project-hash>/`.
+
+All child sessions (L1, L2, solo) are local `.jsonl` files only. On ephemeral containers,
+these vanish when the container is destroyed.
+
+### Agent Level Definitions
+
+| Level | Role | Examples |
+|---|---|---|
+| **L0** | Boss / Orchestrator | You (the CCW AI), or a local CLI user's session |
+| **L1** | Team Leader or Solo Agent | Spawned by L0, may manage a team or work alone |
+| **L2** | Teammate | Spawned by L1 Team Leader via TeamCreate, works within a team |
 
 ### Container Lifecycle
 
-The web session container uses ephemeral storage (`none 30G`). Everything outside of git
-lives on this filesystem. When the container is destroyed (which happens when sessions
-time out or are revisited after a gap), `~/.claude/` is **wiped**. The git repo is
-re-cloned from the remote.
+The web container uses ephemeral storage (`none 30G`). When destroyed and recreated
+(session timeout, revisiting an old thread), `~/.claude/` is **wiped**. The git repo
+is re-cloned. This means:
 
-This means:
-- Your Boss session **survives** (loaded from session ingress on resume)
-- All child/team session files **are lost**
-- MEMORY.md in `~/.claude/projects/` is also lost (but is rebuilt from the system)
-- Files committed to git **survive** (re-cloned)
+- Boss session **survives** (loaded from session ingress)
+- All child `.jsonl` session files **are lost**
+- Files committed and pushed to git **survive** (re-cloned)
 
-### Preserving Child Sessions via Git
-
-To make child sessions survive across container rebuilds, commit a **session registry**
-to git. This is lighter and more practical than committing the raw `.jsonl` files
-(which can be 2MB+ each).
-
-#### Session Registry Pattern
-
-Maintain a registry file in your branch:
-
-```markdown
-<!-- .company/sessions/registry.md -->
-# Active Sessions Registry
-
-## Team Leaders
-
-| Codename | Session UUID | Model | Status | Created | Summary |
-|----------|-------------|-------|--------|---------|---------|
-| Alpha | a1ab99a3-7032-4d7e-bb49-f383d82c896c | opus | completed | 2026-02-08 | Cache system implementation |
-| Bravo | b2cd88f1-3e45-4a1c-9876-def012345678 | opus | in_progress | 2026-02-08 | Auth refactor |
-
-## Solo Agents
-
-| Name | Session UUID | Model | Status | Created | Summary |
-|------|-------------|-------|--------|---------|---------|
-| Coverage | c3ef77d2-5f67-4b2d-a543-abc987654321 | sonnet | completed | 2026-02-08 | Test coverage analysis |
-```
-
-This way, any Boss in any future chat thread can see what teams existed, their status,
-and their session UUIDs.
-
-#### Can Sessions Be Resumed from Other Chat Threads?
-
-**Boss session**: Yes, inherently. The server-side persistence means a new container
-loading the same session ID reconnects to the full history. This is what happens when
-you revisit an old chat thread.
-
-**Child sessions**: Only if the `.jsonl` files are present locally. Two approaches:
-
-1. **Commit `.jsonl` files to git** (heavy but complete):
-   ```bash
-   # Save session files to git
-   mkdir -p .company/sessions/data/
-   cp ~/.claude/projects/-home-user-X/LEADER_UUID.jsonl .company/sessions/data/
-   git add .company/sessions/data/ && git commit -m "Preserve team leader session"
-   ```
-   On a new container, restore them:
-   ```bash
-   cp .company/sessions/data/*.jsonl ~/.claude/projects/-home-user-X/
-   # Now --resume LEADER_UUID works
-   ```
-
-2. **Registry only** (light, accept that past sessions can't be resumed):
-   Store only the metadata. Past sessions serve as documentation, not as resumable threads.
-   New threads start fresh with the context from the registry's summaries.
-
-In most cases, **option 2 is better**. Resumed sessions carry their full accumulated
-context window, which may be stale or bloated. Starting a fresh Team Leader with a
-clear mission brief is usually more effective than resuming an old one.
-
-#### Cross-Thread Session Portability
-
-A powerful implication: child session `.jsonl` files committed to git can be resumed
-from **any** chat thread that clones the same repo. This means:
-
-- Thread A creates Team Alpha, commits its session file
-- Thread B (days later, different container) restores the file and resumes Team Alpha
-- Team Alpha's leader picks up where it left off, with full conversation history
-
-This also works for the **Boss's own child session** -- if you spawn a child claude
-with your entire conversation context summarized in a brief, that child's session
-could be resumed by a future Boss in a different thread. Effectively, institutional
-memory via git.
+**Solution**: The Workspaces Protocol below ensures all critical state lives in git.
 
 ---
 
-## Multi-Team Orchestration (Boss Pattern)
+## The Workspaces Protocol
 
-This section describes how to organize and manage multiple teams as the Boss.
+This protocol defines how Bosses, Team Leaders, and Agents organize their work,
+persist their sessions, and maintain a shared registry -- all through git. It unifies
+local CLI sessions and remote CCW sessions under the same structure.
 
-### Folder Structure for Teams
+### Wellknown Locations
 
-Create a workspace hierarchy so each team has its own area:
+| Path | Purpose | Who manages it |
+|---|---|---|
+| `/.claude/projects/` | Session `.jsonl` files committed to git | All levels (L0, L1) |
+| `/workspaces/registry.md` | **The agent registry** -- the single source of truth | L0 Boss (primary), L1 Leaders (scoped writes) |
+| `/workspaces/<repo>/<id>-BOSS/` | L0 Boss's working folder | L0 Boss |
+| `/workspaces/<repo>/<id>-TEAM/` | A team's working folder with chart.md | L0 Boss (creates), L1 Leader (maintains) |
+| `/workspaces/<repo>/<id>-AGENT/` | A solo agent's working folder | L0 Boss (creates), L1 Agent (maintains) |
 
-```
-/home/user/X/
-├── .company/                          # Or any project-level directory
-│   └── teams/
-│       ├── cache-system/
-│       │   ├── brief.md               # Mission brief: what the team should build
-│       │   ├── roster.md              # Suggested team composition
-│       │   └── output/                # Team deposits results here
-│       ├── auth-refactor/
-│       │   ├── brief.md
-│       │   ├── roster.md
-│       │   └── output/
-│       └── test-coverage/
-│           ├── brief.md
-│           ├── roster.md
-│           └── output/
-```
+Here `<id>` is either a server-side session ID (e.g. `session_01BcK...`) for remote
+CCW sessions, or a local project filename / UUID for local CLI sessions.
 
-### Mission Brief (brief.md) -- Written by You Before Spawning the Team
+### The Agent Registry (`/workspaces/registry.md`)
+
+This is the **wellknown** file. Every agent in the system is tracked here. Its structure:
 
 ```markdown
-# Mission: Cache System
+# Agent Registry
 
-## Objective
+## L0 Bosses
+
+| ID | Type | Model | Status | Created | Summary |
+|----|------|-------|--------|---------|---------|
+| session_01BcKBG6E3cP45UMs9bAbhZq | remote | opus | active | 2026-02-08 | Main orchestrator for X project |
+| 75ce885f-ca74-4ad5-b941-31d170495578 | local | opus | active | 2026-02-08 | Local dev session |
+
+## L1 Teams & Agents
+
+| ID | Type | Parent L0 | Role | Model | Status | Created | Summary |
+|----|------|-----------|------|-------|--------|---------|---------|
+| a1ab99a3-... | team-leader | session_01BcK... | Alpha | opus | completed | 2026-02-08 | Cache system |
+|   ↳ agent-a628ebb | teammate | Alpha | Implementer | opus | completed | 2026-02-08 | Core cache module |
+|   ↳ agent-a91837d | teammate | Alpha | Tester | sonnet | completed | 2026-02-08 | Cache unit tests |
+| b2cd88f1-... | team-leader | session_01BcK... | Bravo | opus | in_progress | 2026-02-08 | Auth refactor |
+|   ↳ agent-b1234ab | teammate | Bravo | Implementer | opus | in_progress | 2026-02-08 | JWT redesign |
+| c3ef77d2-... | solo-agent | session_01BcK... | Charlie | sonnet | completed | 2026-02-08 | Test coverage |
+```
+
+#### Registry Mutation Rules
+
+| Level | Can create entries | Can modify entries | Scope |
+|---|---|---|---|
+| **L0 Boss** | Yes -- any entry | Yes -- any entry | Full registry control |
+| **L1 Team Leader** | Yes -- own team members only | Yes -- own team's section only | Must match `chart.md` from their team folder |
+| **L1 Solo Agent** | Yes -- own entry if missing | Yes -- own entry only | Self-registration only |
+| **L2 Teammate** | **NO** | **NO** | Never touches registry |
+
+An L1 Team Leader may add its entry and its team members' entries if they're missing,
+but only under an already-existing section for their team (or one they create based on
+the `chart.md` the Boss left in their team folder).
+
+### Session File Protocol
+
+#### Rule: Commit session files on every push
+
+Whenever you commit and push for any reason, also sync session files:
+
+```bash
+# Save current session files to git
+mkdir -p .claude/projects/
+cp ~/.claude/projects/-home-user-X/*.jsonl .claude/projects/ 2>/dev/null
+# Include subagent sessions
+for dir in ~/.claude/projects/-home-user-X/*/subagents; do
+  [ -d "$dir" ] || continue
+  parent=$(basename "$(dirname "$dir")")
+  mkdir -p ".claude/projects/$parent/subagents"
+  cp "$dir"/*.jsonl ".claude/projects/$parent/subagents/" 2>/dev/null
+done
+git add .claude/projects/
+# Then proceed with your normal commit
+```
+
+This ensures all session data is backed up in git on every push.
+
+#### Rule: Restore session files at session start
+
+At the start of every new session (when the container is fresh), restore sessions
+from git:
+
+```bash
+# Restore session files from git into the shell
+if [ -d ".claude/projects" ]; then
+  cp .claude/projects/*.jsonl ~/.claude/projects/-home-user-X/ 2>/dev/null
+  # Restore subagent sessions
+  for dir in .claude/projects/*/subagents; do
+    [ -d "$dir" ] || continue
+    parent=$(basename "$(dirname "$dir")")
+    mkdir -p ~/.claude/projects/-home-user-X/"$parent"/subagents
+    cp "$dir"/*.jsonl ~/.claude/projects/-home-user-X/"$parent"/subagents/ 2>/dev/null
+  done
+fi
+```
+
+After this, all prior sessions are available for `--resume <uuid>`.
+
+### Workspace Folders
+
+#### Boss Folder (`/workspaces/<repo>/<id>-BOSS/`)
+
+Created and managed by the L0 Boss. Contains:
+
+```
+/workspaces/X/session_01BcK...-BOSS/
+├── chart.md          # What this Boss session is about, evolving summary
+└── notes.md          # Optional: decisions made, open questions, etc.
+```
+
+The Boss creates `chart.md` when the session's purpose becomes clear, and updates
+it as work progresses. This serves as institutional memory: if a new Boss picks up
+this session (or its session file), the chart explains what was going on.
+
+#### Team Folder (`/workspaces/<repo>/<id>-TEAM/`)
+
+Created by the L0 Boss **before** spawning the Team Leader. Contains:
+
+```
+/workspaces/X/a1ab99a3-TEAM/
+├── chart.md          # Mission brief + team composition (written by Boss)
+└── output/           # Team deposits deliverables here
+```
+
+The `chart.md` is the Team Leader's instructions. It includes:
+
+```markdown
+# Team Alpha: Cache System
+
+## Mission
 Design and implement a caching layer for the API endpoints in src/api/.
 
 ## Deliverables
 1. Cache module with TTL support (src/cache/)
 2. Integration with existing API handlers
 3. Unit tests with >80% coverage
-4. Summary report in this folder's output/ directory
+4. Final report in this folder's output/
 
 ## Constraints
 - Use Redis client library already in package.json
-- Do not modify src/auth/ (another team owns that)
+- Do not modify src/auth/ (Team Bravo owns that)
 - Budget: keep total cost under $2
 
-## Report Back
-When done, write output/report.md with:
-- What was built
-- Files created/modified
-- Test results
-- Any open issues or recommendations
+## Team Composition
+- Team Leader (you): Opus 4.6 -- coordination, architecture, final review
+- Implementer "Inca": Opus 4.6 -- write the cache module
+- Tester "Tango": Sonnet 4.5 -- write and run tests
 
-## Team Composition (suggested)
-- Team Leader: Opus 4.6 (coordination, architecture decisions)
-- Implementer: Sonnet 4.5 (write the code)
-- Tester: Sonnet 4.5 (write and run tests)
+## Reporting
+When done, write output/report.md and update your entry in /workspaces/registry.md
 ```
 
-### Spawning a Team Leader
+The L1 Team Leader reads this chart, creates the team, and may update the chart
+with actual session IDs once teammates are spawned. The Leader also updates the
+registry with teammate entries.
+
+#### Agent Folder (`/workspaces/<repo>/<id>-AGENT/`)
+
+For solo agents (no team). Same structure but simpler:
+
+```
+/workspaces/X/c3ef77d2-AGENT/
+├── chart.md          # Mission brief (written by Boss)
+└── output/           # Agent deposits results here
+```
+
+### Unified Local + Remote Protocol
+
+This protocol applies equally to:
+- **Remote CCW sessions** (L0 Boss is the web AI, children are spawned CLI processes)
+- **Local CLI sessions** (L0 Boss is a user's local Claude Code, children are spawned too)
+
+The difference is only in how the L0 Boss session itself is identified:
+
+| Environment | L0 Session ID format | L0 Session storage |
+|---|---|---|
+| CCW (remote) | `session_01BcK...` (server-side) | Session ingress service |
+| Local CLI | `75ce885f-...` (local UUID) | `~/.claude/projects/<hash>/UUID.jsonl` |
+
+Both use the same `/workspaces/` folder structure, the same `registry.md`, and the
+same `.claude/projects/` session file protocol. A local CLI Boss can resume a Team
+Leader session that was originally created by a remote CCW Boss, and vice versa --
+as long as the `.jsonl` files are in `.claude/projects/` in the repo.
+
+### Cross-Thread Session Portability
+
+Because everything lives in git:
+
+1. **Thread A** (container 1): Boss creates Team Alpha, spawns it, commits session
+   files and registry to git, pushes
+2. **Thread B** (container 2, days later): New Boss clones repo, runs session restore
+   script, reads registry, sees Team Alpha's UUID, resumes it with `--resume <uuid>`
+3. Team Alpha's Leader picks up with full conversation history
+
+This also works for the **Boss's own session**: if a remote Boss commits a summary
+of its context as a `chart.md`, a new Boss in a different thread can read it and
+continue the work -- or even spawn the old Boss's session as a child agent:
+
+```bash
+# Resume a previous Boss session as an L1 advisor
+claude_agent -p "You are an advisor. Review your prior work and brief me on status." \
+  --resume "75ce885f-ca74-4ad5-b941-31d170495578" --model opus --output-format json
+```
+
+---
+
+## Multi-Team Orchestration (Boss Pattern)
+
+This section describes how to organize and manage multiple teams as the L0 Boss,
+using the Workspaces Protocol defined above.
+
+### Spawning a Team
+
+The full workflow:
 
 ```bash
 TOKEN=$(cat /home/claude/.claude/remote/.session_ingress_token)
+REPO_NAME="X"  # or whatever the repo is called
 
-# Read the brief to pass as context
-BRIEF=$(cat /home/user/X/.company/teams/cache-system/brief.md)
+# 1. Create the team workspace with chart.md
+TEAM_ID="alpha-cache"
+mkdir -p "workspaces/$REPO_NAME/$TEAM_ID-TEAM/output"
+cat > "workspaces/$REPO_NAME/$TEAM_ID-TEAM/chart.md" << 'CHART'
+# Team Alpha: Cache System
 
+## Mission
+Design and implement a caching layer for API endpoints in src/api/.
+
+## Deliverables
+1. Cache module with TTL support
+2. Integration with existing API handlers
+3. Unit tests with >80% coverage
+4. Report in this folder's output/report.md
+
+## Constraints
+- Do not modify src/auth/ (Team Bravo owns that)
+
+## Team Composition
+- Leader (you): Opus 4.6
+- Implementer "Inca": Opus 4.6
+- Tester "Tango": Sonnet 4.5
+
+## Reporting
+Update /workspaces/registry.md with your team entries when spawned.
+Write output/report.md when done.
+CHART
+
+# 2. Commit workspace before spawning (prevent stop hook issues)
+git add "workspaces/" && git commit -m "Create Team Alpha workspace"
+
+# 3. Spawn the Team Leader
+CHART_CONTENT=$(cat "workspaces/$REPO_NAME/$TEAM_ID-TEAM/chart.md")
 timeout 300 env \
   CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
   CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR="" \
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
-  claude -p "You are a Team Leader. Read your mission brief below and execute it.
+  claude -p "You are a Team Leader. Your chart is below. Execute the mission.
 
-Create a team called 'cache-team' to accomplish the mission. Spawn teammates as
-described in the brief. Coordinate their work, review their output, and write the
-final report to .company/teams/cache-system/output/report.md when done.
+CHART:
+$CHART_CONTENT
 
-MISSION BRIEF:
-$BRIEF" \
+PROTOCOL RULES:
+- You are L1. You may update /workspaces/registry.md with your team's entries.
+- Your team folder is at workspaces/$REPO_NAME/$TEAM_ID-TEAM/
+- Write deliverables to your output/ subfolder.
+- L2 teammates must NOT modify the registry." \
   --model opus \
   --output-format json \
   --permission-mode acceptEdits \
-  > /tmp/cache-team-result.json 2>/dev/null &
+  > /tmp/$TEAM_ID-result.json 2>/dev/null &
 
-CACHE_TEAM_PID=$!
-echo "Cache team leader: PID $CACHE_TEAM_PID"
+LEADER_PID=$!
+
+# 4. Capture session ID when done
+wait $LEADER_PID
+LEADER_SID=$(python3 -c "import json; print(json.load(open('/tmp/$TEAM_ID-result.json'))['session_id'])")
+
+# 5. Update registry
+# (Boss adds/updates the Team Leader entry with the actual session ID)
 ```
 
 ### Managing Multiple Teams in Parallel
@@ -495,54 +632,44 @@ TOKEN=$(cat /home/claude/.claude/remote/.session_ingress_token)
 export CLAUDE_CODE_OAUTH_TOKEN="$TOKEN"
 export CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=""
 
-# Team Alpha: Cache System
-BRIEF_A=$(cat .company/teams/cache-system/brief.md)
+# Spawn Team Alpha (with team)
+CHART_A=$(cat workspaces/X/alpha-cache-TEAM/chart.md)
 timeout 300 env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
-  claude -p "You are Team Leader Alpha. Mission: $BRIEF_A" \
+  claude -p "You are Team Leader Alpha. Chart: $CHART_A" \
   --model opus --output-format json --permission-mode acceptEdits \
   > /tmp/team-alpha.json 2>/dev/null &
 PID_A=$!
 
-# Team Bravo: Auth Refactor
-BRIEF_B=$(cat .company/teams/auth-refactor/brief.md)
+# Spawn Team Bravo (with team)
+CHART_B=$(cat workspaces/X/bravo-auth-TEAM/chart.md)
 timeout 300 env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
-  claude -p "You are Team Leader Bravo. Mission: $BRIEF_B" \
+  claude -p "You are Team Leader Bravo. Chart: $CHART_B" \
   --model opus --output-format json --permission-mode acceptEdits \
   > /tmp/team-bravo.json 2>/dev/null &
 PID_B=$!
 
-# Solo agent (no team needed): Test Coverage
-timeout 120 claude -p "Analyze test coverage gaps in src/" \
+# Spawn Solo Agent Charlie (no team needed)
+CHART_C=$(cat workspaces/X/charlie-coverage-AGENT/chart.md)
+timeout 120 claude -p "You are Agent Charlie. Chart: $CHART_C" \
   --model sonnet --output-format json \
-  > /tmp/solo-coverage.json 2>/dev/null &
+  > /tmp/solo-charlie.json 2>/dev/null &
 PID_C=$!
 
-echo "Launched: Alpha=$PID_A, Bravo=$PID_B, Coverage=$PID_C"
-
-# Wait for all (or poll individually)
+echo "Launched: Alpha=$PID_A, Bravo=$PID_B, Charlie=$PID_C"
 wait $PID_A $PID_B $PID_C
+
+# Sync session files + update registry + commit + push
 ```
-
-### Codenames and Organization
-
-Using codenames makes teams easier to manage in logs, file paths, and prompts:
-
-| Codename | Mission | Leader Model | Team Size |
-|----------|---------|-------------|-----------|
-| Alpha | Cache system | Opus | 3 |
-| Bravo | Auth refactor | Opus | 2 |
-| Charlie | Test coverage | Sonnet (solo) | 0 |
-| Delta | API docs | Haiku (solo) | 0 |
 
 ### Cross-Team Coordination
 
-Since teams can't communicate directly with each other, you (the Boss) relay:
+Teams can't communicate directly. The L0 Boss relays:
 
 ```bash
 # Team Alpha finished -- read their report
-ALPHA_REPORT=$(cat .company/teams/cache-system/output/report.md)
+ALPHA_REPORT=$(cat workspaces/X/alpha-cache-TEAM/output/report.md)
 
-# Feed Alpha's output into Team Bravo (via resume or new prompt)
+# Feed Alpha's output into Team Bravo (via resume)
 timeout 300 env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1" \
   claude -p "Team Alpha completed the cache system. Here is their report:
 
@@ -553,6 +680,38 @@ Specifically, cache the JWT validation results as Alpha suggests." \
   --resume "$BRAVO_SESSION_ID" \
   --model opus --output-format json --permission-mode acceptEdits \
   > /tmp/team-bravo-phase2.json 2>/dev/null
+```
+
+### Boss Self-Management
+
+The L0 Boss should also maintain its own workspace and registry entry:
+
+```bash
+# Create Boss workspace (once, at start of session)
+BOSS_ID="session_01BcKBG6E3cP45UMs9bAbhZq"  # or local UUID
+mkdir -p "workspaces/X/${BOSS_ID}-BOSS"
+
+# Write chart.md when purpose becomes clear
+cat > "workspaces/X/${BOSS_ID}-BOSS/chart.md" << 'EOF'
+# Boss Session: X Project Orchestration
+
+## Purpose
+Orchestrate multi-team development of project X features.
+
+## Active Teams
+- Alpha (cache system) -- completed
+- Bravo (auth refactor) -- in progress
+
+## Decisions Made
+- Using Redis for caching (2026-02-08)
+- Opus 4.6 for all implementers (systems-level work)
+
+## Open Questions
+- Integration testing strategy across teams
+EOF
+
+# Register self in registry
+# (update /workspaces/registry.md L0 Bosses section)
 ```
 
 ---
